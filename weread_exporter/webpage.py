@@ -70,26 +70,31 @@ class WeReadWebPage(object):
         self._proxy_installed: bool = False
 
     async def get_book_info(self) -> Dict[str, Any]:
-        html = (await utils.fetch(self._home_url)).decode()
+        # bookDetail 页对 encodeId 形式的书籍 ID 会返回空 bookInfo（isBookInfoError），
+        # 改从 reader 页抓取元数据（目录与 bookInfo 均完整），并带上登录 cookie。
+        reader_url = self._chapter_root_url + self._book_id
+        headers = {"Cookie": self._format_cookie()} if self._cookie else None
+        html = (await utils.fetch(reader_url, headers=headers)).decode()
         pos1 = html.find("window.__INITIAL_STATE__")
         if pos1 <= 0:
-            raise RuntimeError("Unexpected html: %s" % html)
+            raise RuntimeError("Unexpected html: %s" % html[:500])
         pos1 = html.find("=", pos1)
         pos2 = html.find("};", pos1)
         data = html[pos1 + 1 : pos2 + 1].strip()
         data = json.loads(data)
         book_info: Dict[str, Any] = {}
-        book_info["title"] = data["reader"]["bookInfo"]["title"]
-        book_info["author"] = data["reader"]["bookInfo"]["author"]
-        book_info["cover"] = data["reader"]["bookInfo"]["cover"]
-        book_info["intro"] = data["reader"]["bookInfo"]["intro"]
+        book_info_obj = data["reader"]["bookInfo"]
+        book_info["title"] = book_info_obj.get("title", "")
+        book_info["author"] = book_info_obj.get("author", "")
+        book_info["cover"] = book_info_obj.get("cover", "")
+        book_info["intro"] = book_info_obj.get("intro", "")
         book_info["chapters"] = []
         for chapter in data["reader"]["chapterInfos"]:
             chap = {
-                "id": chapter["chapterUid"],
-                "title": chapter["title"],
-                "level": chapter["level"],
-                "words": chapter["wordCount"],
+                "id": chapter.get("chapterUid"),
+                "title": chapter.get("title", ""),
+                "level": chapter.get("level", 1),
+                "words": chapter.get("wordCount", 0),
                 "anchors": [],
             }
             if chapter["anchors"]:
@@ -427,36 +432,36 @@ class WeReadWebPage(object):
             )
 
     async def login(self) -> bool:
-        selectors = [
-            "button.navBar_link_Login",
-            "div.readerTopBar_right button.actionItem",
-        ]
-        for selector in selectors:
-            script = (
-                "var elem = document.querySelector('%s'); elem && elem.innerText"
-                % (selector)
-            )
-            result = await self._page.evaluate(script)
-            if not result:
-                continue
-            if "登录" not in result:
-                continue
-            await self._page.click(selector)
-            script = "document.querySelector('div.menu_container img.wr_avatar_img')"
-            time0 = time.time()
-            while time.time() - time0 < 300:
-                logging.info("[%s] Waiting for login" % self.__class__.__name__)
-                await asyncio.sleep(10)
+        # 半手动登录：不自动点击登录按钮（自动 click 在新版 Chrome + pyppeteer
+        # 组合下会触发 page 被关闭的兼容问题）。改为提示用户在浏览器窗口中
+        # 手动点击「登录」并扫码，本函数只负责等待登录完成。
+        logging.warning(
+            "[%s] >>> 请在弹出的浏览器窗口中手动点击「登录」并用微信扫码，"
+            "程序将等待您完成登录（最多 10 分钟）..." % self.__class__.__name__
+        )
+        script = (
+            "document.querySelector('img.wr_avatar_img') && "
+            "document.querySelector('img.wr_avatar_img').getAttribute('src');"
+        )
+        time0 = time.time()
+        while time.time() - time0 < 600:
+            logging.info("[%s] Waiting for manual login" % self.__class__.__name__)
+            await asyncio.sleep(10)
+            try:
                 result = await self._page.evaluate(script)
-                if not result:
-                    continue
+            except Exception:
+                # 页面可能正在导航（如点击登录后跳转），evaluate 暂时失败，继续等待
+                logging.warning(
+                    "[%s] evaluate temporary failed, page may be navigating, "
+                    "keep waiting" % self.__class__.__name__
+                )
+                continue
+            if result and not result.endswith("Default.svg"):
                 logging.info("[%s] Login success" % self.__class__.__name__)
                 await self._update_cookie()
                 self._save_cookie()
                 return True
-            else:
-                raise RuntimeError("Login timeout")
-        return False
+        raise RuntimeError("Login timeout (manual)")
 
     async def _get_from_cache_or_server(
         self, url: str, headers: Optional[Dict[str, str]] = None
@@ -629,29 +634,62 @@ class WeReadWebPage(object):
         return result
 
     async def _check_next_page(self) -> None:
-        while True:
+        # 新版微信读书翻页控件由 button.readerFooter_button 改为 div.renderTarget_pager_content；
+        # 章节读完时出现结尾卡片 .readerFooter_ending_finish。先等首页渲染完成再判断。
+        for _ in range(20):
             try:
-                await self.wait_for_selector("button.readerFooter_button", timeout=60)
-            except pyppeteer.errors.TimeoutError:
-                logging.info("[%s] load selector timeout " % self.__class__.__name__)
+                if await asyncio.wait_for(
+                    self._page.evaluate("canvasContextHandler.data.complete"), timeout=5
+                ):
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        await asyncio.sleep(2)
+        finish_expr = "!!document.querySelector('.readerFooter_ending_finish')"
+        pager_expr = (
+            "(function(){"
+            "var p=document.querySelector('.renderTarget_pager_content');"
+            "if(p){var t=(p.innerText||'').trim();if(t==='下一页'||t==='下一章')return t;}"
+            "var els=document.querySelectorAll('div,button,span,a');"
+            "for(var i=0;i<els.length;i++){var t2=(els[i].innerText||'').trim();"
+            "if(t2==='下一页'||t2==='下一章')return t2;}"
+            "return null;})()"
+        )
+        for _ in range(200):
+            try:
+                finished = await asyncio.wait_for(self._page.evaluate(finish_expr), timeout=10)
+            except Exception:
+                finished = False
+            if finished:
+                logging.info("[%s] Chapter finished (ending card)" % self.__class__.__name__)
                 break
-            result = await self._page.evaluate(
-                "document.getElementsByClassName('readerFooter_button')[0].innerText;"
-            )
-            if result == "下一页":
+            try:
+                result = await asyncio.wait_for(self._page.evaluate(pager_expr), timeout=10)
+            except Exception:
+                result = None
+            if result == "下一章":
+                break
+            elif result == "下一页":
                 logging.info("[%s] Go to next page" % self.__class__.__name__)
-                await self._page.evaluate(
-                    r"canvasContextHandler.data.markdown += '\n\n';"
-                )
+                try:
+                    await self._page.evaluate(r"canvasContextHandler.data.markdown += '\n\n';")
+                except Exception:
+                    pass
                 await self.pre_load_page()
-                await self._page.click("button.readerFooter_button")
-                await asyncio.sleep(1)
-            elif result == "下一章":
-                break
-            elif result.startswith("登录"):
+                try:
+                    await self._page.click(".renderTarget_pager_content")
+                except Exception:
+                    try:
+                        await self._page.keyboard.press("ArrowRight")
+                    except Exception:
+                        pass
+                await asyncio.sleep(2)
+            elif result and result.startswith("登录"):
                 raise utils.LoginRequiredError()
             else:
-                raise NotImplementedError(result)
+                logging.info("[%s] No pager control, assume chapter done" % self.__class__.__name__)
+                break
 
     def _get_chapter_url(self, chapter_id: str) -> str:
         return "%s%sk%s" % (
@@ -665,7 +703,7 @@ class WeReadWebPage(object):
         # await self.clear_cache()
         await self.pre_load_page()
         self._url = self._get_chapter_url(chapter_id)
-        await self._page.goto(self._url, timeout=1000 * timeout)
+        await self._page.goto(self._url, timeout=1000 * timeout, waitUntil="domcontentloaded")
         try:
             await self._check_next_page()
         except utils.LoginRequiredError:
