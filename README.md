@@ -24,13 +24,56 @@ $ python -m weread_exporter -b $book_id -o epub -o pdf
 
 命令行还支持一个可选参数`--force-login`，默认为`False`，指定该参数时，会先进行登录操作。
 
-## 已知问题（新版微信读书兼容性）
+## 新版微信读书兼容性说明
 
-**当前限制：暂无法导出正文内容。**
+### 现状
 
-新版微信读书升级了反爬机制，正文渲染方式由 `fillText`（绘制文字）改为 `fillRect`（绘制像素块，文字被图像化）。本工具依赖 hook canvas 的 `fillText` 方法来提取文字（见 `weread_exporter/hook.js`），新版不再调用该方法，导致 hook 虽能成功注入，却捕获不到任何文字，导出的正文为空。此为服务端渲染方式变化所致，并非本地配置问题。
+| 工具 | 浏览器层 | 现状 |
+|------|---------|------|
+| `weread_exporter`（本项目主程序） | pyppeteer | 新版微信读书下已失效 |
+| `full_book.py`（独立的替代脚本） | playwright | 可成功导出整本 epub |
 
-为兼容新版运行环境（新版 Chrome + 新版微信读书 DOM），`weread_exporter/webpage.py` 已做如下调整（使登录、目录读取、翻页等环节能在新版下跑通，但最终仍受限于上文的正文提取问题）：
+### 为什么 weread_exporter 失效
+
+经多轮验证，失效由两个因素叠加导致，**并非单纯的"反爬无法绕过"**：
+
+1. **cookie 被服务端标记**：cookie 在自动化环境反复使用后会被微信读书标记，之后章节直接"加载失败"、canvas 不渲染。这是最主要的拦截点。
+2. **pyppeteer 的自动化指纹**：pyppeteer（2022 年停更）启动 Chrome 时注入 `--enable-automation`、`navigator.webdriver=true` 等标志，较易被识别。
+
+> 早期曾推测"新版改用 `fillRect` 位图渲染导致 hook 失效"。后续验证表明，`fillRect` 位图只是 cookie 被标记后的降级表现之一，并非平台普遍的渲染方式变更。
+
+### full_book.py 的可行方案
+
+`full_book.py` 是独立脚本（仅复用 `weread_exporter.utils.wr_hash` 与 `weread_exporter/hook.js`），浏览器层换用 playwright。成功的关键三点：
+
+1. **playwright `connect_over_cdp`**：连接到一个**手动启动**的 Chrome（不走 playwright 的 launch），不注入 `--enable-automation`，`navigator.webdriver === false`，指纹干净。
+2. **未被标记的 cookie**：首次或 cookie 失效时，在弹出的浏览器里扫码登录获取新 cookie；旧 cookie 若被标记会导致加载失败。
+3. **修改版 hook.js**：新版阅读页每页 `clearRect`，原 `hook.js` 会随之清空已累积的文字；脚本注入时去掉了 `clearRect` 对 markdown 的重置，使文字能跨页持续累积。
+
+实测可完整导出整本（每章字数与目录 wordCount 吻合）。
+
+### 运行 full_book.py
+
+依赖：`pip install playwright`（另需系统已装 Chrome）。
+
+```bash
+# Chrome 加入 PATH（Windows 示例；macOS/Linux 通常无需此步）
+export PATH="/c/Program Files/Google/Chrome/Application:$PATH"
+
+python full_book.py
+```
+
+脚本顶部按需修改的变量：
+
+- `ENCODE_ID`：书籍 ID，从阅读页 URL `/web/reader/<ENCODE_ID>` 中取
+- `NEW_PROFILE`：临时 Chrome profile 目录（默认放在系统临时目录下）
+- cookie 文件：`cache/cookie.txt`（首次扫码后自动保存，**内含登录凭证，切勿外传/提交**，`.gitignore` 已忽略）
+
+输出：`output/<书名>.epub`，以及 `output/chapters/*.md`（每章一个文件，支持断点续传，中断后重跑自动跳过已抓章节）。
+
+### weread_exporter 的兼容修复（记录备查）
+
+主程序虽已无法直接导出，但 `weread_exporter/webpage.py` 仍做了以下兼容修复，使其至少能跑到"加载正文"这一步：
 
 | 环节 | 问题 | 调整 |
 |------|------|------|
@@ -39,16 +82,49 @@ $ python -m weread_exporter -b $book_id -o epub -o pdf
 | 页面加载 | `page.goto` 等待 `load` 事件超时 | 改用 `waitUntil="domcontentloaded"` |
 | 翻页 | `button.readerFooter_button` 已被移除 | 改用新控件 `div.renderTarget_pager_content`，并通过结尾卡片 `.readerFooter_ending_finish` 判断章节结束 |
 
-### 运行注意事项
-
-- **Chrome 需在 PATH 中**：若 Chrome 未加入系统 PATH，运行前需手动添加（否则报 `ChromeNotInstalledError`），例如：
-  ```bash
-  # Windows (Git Bash)
-  export PATH="/c/Program Files/Google/Chrome/Application:$PATH"
-  ```
-- **首次使用需扫码登录**：运行时弹出的 Chrome 窗口中手动点登录、微信扫码即可；登录态保存在 `cache/cookie.txt`，之后无需重复扫码。
-- **book_id 的获取**：从书籍介绍页 URL `/web/bookDetail/{book_id}` 中取。
-
 ## 免责申明
 
 本工具仅作技术研究之用，请勿用于商业或违法用途，由于使用该工具导致的侵权或其它问题，该本工具不承担任何责任！
+
+## 完整使用步骤（full_book.py）
+
+从零开始导出一本书的完整流程。
+
+### 1. 安装依赖
+
+```bash
+pip install -e .            # 提供 utils.wr_hash、hook.js
+pip install playwright      # 浏览器自动化
+```
+
+另需系统已安装 Chrome（脚本会自动查找：先 PATH，再 Windows / macOS 的默认安装位置）。
+
+### 2. 运行
+
+书籍 ID 作为命令行参数传入：
+
+```bash
+python full_book.py <ENCODE_ID>
+```
+
+获取方法：在微信读书网页版打开该书任一章节，URL 形如 `https://weread.qq.com/web/reader/<ENCODE_ID>`，取中间那串即可。
+
+可选参数：
+
+- `--profile <目录>`：Chrome 用户数据目录（默认用临时目录）
+- `--port <端口>`：Chrome 调试端口（默认 9222，被占用时换一个）
+
+### 3. 登录（首次）
+
+首次运行会弹出 Chrome 窗口，扫码登录微信读书。cookie 自动存 `cache/cookie.txt`，之后无需重复扫码。cookie 失效时（章节"加载失败"）删掉 `cache/cookie.txt` 重跑即可。
+
+### 4. 取结果
+
+- 完整电子书：`output/<书名>.epub`
+- 每章 markdown 源文件：`output/chapters/*.md`（支持断点续传，中断后重跑会自动跳过已抓章节）
+
+### 注意事项
+
+- 运行期间**不要关闭**弹出的 Chrome 窗口，脚本需要通过它读取页面内容。
+- `cache/cookie.txt` 是登录凭证，等价于你的微信读书账号，**不要外传或提交**（`.gitignore` 已忽略 `cache/`）。
+- 章节较多时（如几十上百章）整本抓取需要一定时间，每章约十几秒，可随时中断续传。
