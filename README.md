@@ -54,22 +54,13 @@ $ python -m weread_exporter -b $book_id -o epub -o pdf
 
 ### 运行 full_book.py
 
-依赖：`pip install playwright`（另需系统已装 Chrome）。
+依赖：`pip install playwright`（另需系统已装 Chrome，脚本会自动查找）。
 
 ```bash
-# Chrome 加入 PATH（Windows 示例；macOS/Linux 通常无需此步）
-export PATH="/c/Program Files/Google/Chrome/Application:$PATH"
-
-python full_book.py
+python full_book.py <ENCODE_ID>
 ```
 
-脚本顶部按需修改的变量：
-
-- `ENCODE_ID`：书籍 ID，从阅读页 URL `/web/reader/<ENCODE_ID>` 中取
-- `NEW_PROFILE`：临时 Chrome profile 目录（默认放在系统临时目录下）
-- cookie 文件：`cache/cookie.txt`（首次扫码后自动保存，**内含登录凭证，切勿外传/提交**，`.gitignore` 已忽略）
-
-输出：`output/<书名>.epub`，以及 `output/chapters/*.md`（每章一个文件，支持断点续传，中断后重跑自动跳过已抓章节）。
+书籍 ID（encodeId）从阅读页 URL `/web/reader/<ENCODE_ID>` 中取。首次运行会弹出浏览器扫码登录，cookie 存 `cache/cookie.txt`（**内含登录凭证，切勿外传/提交**，`.gitignore` 已忽略）。完整参数说明与步骤见文末「完整使用步骤」。
 
 ### weread_exporter 的兼容修复（记录备查）
 

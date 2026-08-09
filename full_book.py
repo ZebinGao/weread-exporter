@@ -5,7 +5,7 @@
     python full_book.py <书籍ID>
 
 示例：
-    python full_book.py 35042012a43425f456b6c44514244524344446b36637936634ed71
+    python full_book.py XXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
 说明：
   - 首次运行自动弹出浏览器扫码登录，cookie 存 cache/cookie.txt
