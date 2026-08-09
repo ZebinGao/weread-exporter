@@ -8,6 +8,9 @@ output/
 *.log
 *.egg-info/
 
+# platform 改进版工具的文档需纳入版本控制
+!platform/README.md
+
 # Python
 *.pyc
 *.pyo

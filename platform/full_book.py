@@ -2,13 +2,16 @@
 整本抓取脚本（playwright connect_over_cdp + 新 cookie + 修改版 hook.js）
 
 用法：
-    python full_book.py <书籍ID>
+    python full_book.py <书籍ID>              # 抓全书并生成 epub
+    python full_book.py <书籍ID> --no-epub    # 只抓 md，不自动打包（GUI 用）
+    python full_book.py --login-only          # 仅弹出 Chrome 扫码登录、存 cookie 后退出
 
 示例：
     python full_book.py XXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
 说明：
-  - 启动时直接打开微信读书主页，请在浏览器右上角点「登录」扫码
+  - 登录：首次或 cookie 失效时弹浏览器扫码；--login-only 强制重新扫码
+  - 抓取前先校验 cookie：第 1 章能否渲染出文字（COOKIE_OK / COOKIE_INVALID）
   - hook.js 的 clearRect 不重置 markdown，让文字跨页持续累积
   - 章节边界：翻页直到 URL 变化（进入下一章），取变化前的 md
   - 断点续传：每章 md 存 output/chapters/N.md，重跑自动跳过已抓章节
@@ -17,9 +20,13 @@ import argparse, atexit, json, os, shutil, subprocess, sys, tempfile, time, urll
 from playwright.sync_api import sync_playwright
 from weread_exporter import utils
 
-OUT_DIR = "output"
-CH_DIR = os.path.join(OUT_DIR, "chapters")
 HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(HERE)                       # platform 的父目录 = 仓库根
+OUT_DIR = os.path.join(PROJECT_ROOT, "output")
+CH_DIR = os.path.join(OUT_DIR, "chapters")
+CACHE_DIR = os.path.join(PROJECT_ROOT, "cache")
+COOKIE_FILE = os.path.join(CACHE_DIR, "cookie.txt")
+HOOK_JS = os.path.join(PROJECT_ROOT, "weread_exporter", "hook.js")
 
 
 def find_chrome() -> str:
@@ -53,12 +60,12 @@ def kill_tree(proc) -> None:
         pass
 
 
-def ensure_cookie(browser) -> dict:
-    """检查 cache/cookie.txt；不存在则在 Chrome 已打开的主页等用户扫码。
+def ensure_cookie(browser, force: bool = False) -> dict:
+    """检查 cache/cookie.txt；不存在（或 force）则在 Chrome 已打开的主页等用户扫码。
     刻意不新开 page / 不 goto：直接复用 Chrome 启动时打开的主页，
     这样窗口是用户屏幕的自然大小，右上角登录按钮不会被固定 viewport 裁掉。"""
-    if os.path.isfile("cache/cookie.txt"):
-        return json.load(open("cache/cookie.txt"))
+    if not force and os.path.isfile(COOKIE_FILE):
+        return json.load(open(COOKIE_FILE))
     print("请在浏览器已打开的微信读书主页右上角点「登录」并扫码...", flush=True)
     ctx0 = browser.contexts[0] if browser.contexts else browser.new_context()
     login_page = ctx0.pages[0] if ctx0.pages else ctx0.new_page()
@@ -67,8 +74,8 @@ def ensure_cookie(browser) -> dict:
     for _ in range(72):  # 最多 6 分钟
         if any(c["name"] == "wr_skey" for c in ctx0.cookies()):
             ck = {c["name"]: c["value"] for c in ctx0.cookies()}
-            os.makedirs("cache", exist_ok=True)
-            with open("cache/cookie.txt", "w") as f:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(COOKIE_FILE, "w") as f:
                 json.dump(ck, f)
             print("登录成功，cookie 已保存到 cache/cookie.txt", flush=True)
             return ck
@@ -90,19 +97,52 @@ def get_meta(page, encode_id: str):
     return data['reader']['bookInfo'], data['reader']['chapterInfos']
 
 
+def validate_cookie(page, encode_id: str, chapters: list) -> bool:
+    """抓取前快速校验：用当前 cookie 打开第 1 章，翻几页看 canvas 能否渲染出文字。
+    能渲染（md >= 50 字）→ True；不能（cookie 被服务端标记）→ False。"""
+    if not chapters:
+        return True
+    first = chapters[0]
+    first_url = f"https://weread.qq.com/web/reader/{encode_id}k{utils.wr_hash(str(first['chapterUid']))}"
+    page.goto(first_url, wait_until="domcontentloaded", timeout=60000)   # goto 即重建 canvasContextHandler（markdown 清空）
+    for _ in range(15):
+        try:
+            if page.evaluate("!!(window.canvasContextHandler && window.canvasContextHandler.data && window.canvasContextHandler.data.complete)"):
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
+    sample = ""
+    for _ in range(3):                     # 翻 1–3 页触发渲染
+        try:
+            sample = page.evaluate("window.canvasContextHandler.data.markdown") or ""
+        except Exception:
+            sample = ""
+        if len(sample) >= 50:
+            return True
+        page.keyboard.press("ArrowRight")
+        page.wait_for_timeout(2500)
+    return len(sample) >= 50
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="导出微信读书整本为 epub")
-    parser.add_argument("book", help='书籍 ID（encodeId）：阅读页 URL /web/reader/<book> 中间那串')
+    parser.add_argument("book", nargs="?", help='书籍 ID（encodeId）：阅读页 URL /web/reader/<book> 中间那串')
+    parser.add_argument("--login-only", action="store_true", help="仅扫码登录、存 cookie 后退出（不抓书）")
+    parser.add_argument("--no-epub", action="store_true", help="只抓 md，不在末尾自动生成 epub")
     parser.add_argument("--profile", help="Chrome 用户数据目录（默认用临时目录）")
     parser.add_argument("--port", type=int, default=9222, help="Chrome 调试端口（默认 9222）")
     args = parser.parse_args()
+
+    if not args.login_only and not args.book:
+        parser.error("需要书籍 ID，或使用 --login-only 仅登录")
 
     chrome = find_chrome()
     profile = args.profile or tempfile.mkdtemp(prefix="weread_chrome_")
     encode_id = args.book
     port = args.port
 
-    hook_js = open(os.path.join(HERE, "weread_exporter", "hook.js"), encoding="utf-8").read()
+    hook_js = open(HOOK_JS, encoding="utf-8").read()
     hook_js = hook_js.replace('this.data.markdown = "";', '// keep md accumulating across pages')
     hook_js += "\n;\nwindow.canvasContextHandler = canvasContextHandler;"
 
@@ -125,13 +165,25 @@ def main() -> None:
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(endpoint)
-        ck = ensure_cookie(browser)                       # 登录用 Chrome 自己的窗口（屏幕自然大小）
+        ck = ensure_cookie(browser, force=args.login_only)     # --login-only 强制重新扫码
+
+        if args.login_only:
+            browser.close()
+            return                                              # 仅登录，到此结束
+
         context = browser.new_context(viewport={"width": 1920, "height": 1080})  # 抓取用固定 viewport
         context.add_init_script(hook_js)
         context.add_cookies([{"name": k, "value": v, "url": "https://weread.qq.com", "secure": True} for k, v in ck.items()])
         page = context.new_page()
         book_info, chapters = get_meta(page, encode_id)
         print(f"BOOK: {book_info.get('title')} | {len(chapters)} chapters", flush=True)
+
+        # ---- 抓取前校验 cookie：能否渲染出正文 ----
+        if not validate_cookie(page, encode_id, chapters):
+            print("COOKIE_INVALID: cookie 无法抓到正文，请点「登录」重新扫码", flush=True)
+            browser.close()
+            sys.exit(2)
+        print("COOKIE_OK: 正文可正常渲染，开始抓取...", flush=True)
 
         for idx, ch in enumerate(chapters):
             uid = ch['chapterUid']
@@ -192,6 +244,10 @@ def main() -> None:
             print(f"[{idx+1}/{len(chapters)}] {title}: {len(md_clean)} chars (pages~{page_idx+1})", flush=True)
         browser.close()
 
+    if args.no_epub:
+        print("=== 抓取完成（未生成 epub，可用 make_epub.py 打包）===", flush=True)
+        return
+
     # 生成 epub
     import markdown as md_lib
     from ebooklib import epub
@@ -203,7 +259,7 @@ def main() -> None:
     book.set_language("zh-CN")
     book.add_author(book_info.get('author') or "未知")
     spine = ["nav"]; toc = []
-    files = sorted(os.listdir(CH_DIR))
+    files = sorted(f for f in os.listdir(CH_DIR) if f.endswith(".md"))
     for i, fn in enumerate(files):
         t = f"第{i+1}章"
         c = open(os.path.join(CH_DIR, fn), encoding="utf-8").read()
@@ -217,7 +273,8 @@ def main() -> None:
     book.add_item(epub.EpubNav())
     book.spine = spine
     out = os.path.join(OUT_DIR, f"{safe_title}.epub")
-    epub.write_epub(out, book, {})
+    # epub3_pages=False：关闭 ebooklib 的 nav 分页（它会逐章用 lxml 解析 HTML，遇空章节会抛 "Document is empty"）
+    epub.write_epub(out, book, {"epub3_pages": False})
     print(f"=== EPUB saved: {out} ===", flush=True)
 
 

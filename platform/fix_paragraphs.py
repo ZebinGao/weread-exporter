@@ -11,7 +11,11 @@
     python fix_paragraphs.py a.bak b.bak     # 处理指定文件（输出去掉 .bak）
     python fix_paragraphs.py --min 20 *.bak  # 调独句长度阈值
 """
-import re, sys, glob, argparse
+import os, re, sys, glob, argparse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(HERE)   # platform 的父目录 = 仓库根
+CH_DIR = os.path.join(PROJECT_ROOT, "output", "chapters")
 
 END_MARKS = "。！？；：）」＂\"'…"
 MIN_LEN = 15   # 行长小于此值且行末非句末标点 → 视为独句，独立成段
@@ -45,7 +49,7 @@ def main():
     ap.add_argument("--min", type=int, default=MIN_LEN, help=f"独句长度阈值（默认 {MIN_LEN}）")
     args = ap.parse_args()
 
-    files = args.files or sorted(glob.glob("output/chapters/*.md"))
+    files = args.files or sorted(glob.glob(os.path.join(CH_DIR, "*.md")))
     for src in files:
         if src.endswith(".bak"):
             md = src[:-4]
