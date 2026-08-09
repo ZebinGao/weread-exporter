@@ -8,7 +8,7 @@
     python full_book.py XXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
 说明：
-  - 首次运行自动弹出浏览器扫码登录，cookie 存 cache/cookie.txt
+  - 启动时直接打开微信读书主页，请在浏览器右上角点「登录」扫码
   - hook.js 的 clearRect 不重置 markdown，让文字跨页持续累积
   - 章节边界：翻页直到 URL 变化（进入下一章），取变化前的 md
   - 断点续传：每章 md 存 output/chapters/N.md，重跑自动跳过已抓章节
@@ -53,32 +53,40 @@ def kill_tree(proc) -> None:
         pass
 
 
-def ensure_cookie(context) -> dict:
-    """检查 cache/cookie.txt；不存在则弹出浏览器扫码登录获取。"""
+def ensure_cookie(browser) -> dict:
+    """检查 cache/cookie.txt；不存在则在 Chrome 已打开的主页等用户扫码。
+    刻意不新开 page / 不 goto：直接复用 Chrome 启动时打开的主页，
+    这样窗口是用户屏幕的自然大小，右上角登录按钮不会被固定 viewport 裁掉。"""
     if os.path.isfile("cache/cookie.txt"):
         return json.load(open("cache/cookie.txt"))
-    print("未找到 cache/cookie.txt，请在弹出的浏览器窗口扫码登录微信读书...", flush=True)
-    login_page = context.new_page()
-    login_page.goto("https://weread.qq.com/", wait_until="domcontentloaded", timeout=60000)
+    print("请在浏览器已打开的微信读书主页右上角点「登录」并扫码...", flush=True)
+    ctx0 = browser.contexts[0] if browser.contexts else browser.new_context()
+    login_page = ctx0.pages[0] if ctx0.pages else ctx0.new_page()
+    if "weread.qq.com" not in (login_page.url or ""):
+        login_page.goto("https://weread.qq.com/", wait_until="domcontentloaded", timeout=60000)
     for _ in range(72):  # 最多 6 分钟
-        if any(c["name"] == "wr_skey" for c in context.cookies()):
-            ck = {c["name"]: c["value"] for c in context.cookies()}
+        if any(c["name"] == "wr_skey" for c in ctx0.cookies()):
+            ck = {c["name"]: c["value"] for c in ctx0.cookies()}
             os.makedirs("cache", exist_ok=True)
             with open("cache/cookie.txt", "w") as f:
                 json.dump(ck, f)
             print("登录成功，cookie 已保存到 cache/cookie.txt", flush=True)
-            login_page.close()
             return ck
         time.sleep(5)
     raise SystemExit("登录超时（6 分钟内未检测到扫码）")
 
 
 def get_meta(page, encode_id: str):
-    page.goto(f"https://weread.qq.com/web/reader/{encode_id}", wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(3000)
-    data = page.evaluate("(()=>{try{return JSON.parse(JSON.stringify(window.__INITIAL_STATE__))}catch(e){return null}})()")
-    if not data:
+    # 用 goto 返回的 response.text() 拿服务端原始 HTML（含 __INITIAL_STATE__ 的 <script>）。
+    # 不用 page.content()（渲染后 DOM，部分书前端会删掉该 script），
+    # 也不用 evaluate(window.__INITIAL_STATE__)（前端运行时对象，部分书会改掉 chapterInfos）。
+    response = page.goto(f"https://weread.qq.com/web/reader/{encode_id}", wait_until="domcontentloaded", timeout=60000)
+    html = response.text()
+    p1 = html.find("window.__INITIAL_STATE__")
+    if p1 < 0:
         raise RuntimeError("无法读取书籍目录（__INITIAL_STATE__）")
+    p1 = html.find("=", p1); p2 = html.find("};", p1)
+    data = json.loads(html[p1 + 1:p2 + 1].strip())
     return data['reader']['bookInfo'], data['reader']['chapterInfos']
 
 
@@ -100,9 +108,10 @@ def main() -> None:
 
     os.makedirs(CH_DIR, exist_ok=True)
 
-    # 启动 Chrome（手动启动 + 调试端口；不走 playwright launch，保持 navigator.webdriver=false）
+    # 启动 Chrome：直接打开微信读书主页 + 最大化（登录按钮在右上角，窗口最大化后不会被裁掉）
     proc = subprocess.Popen(
-        [chrome, f"--remote-debugging-port={port}", f"--user-data-dir={profile}", "--no-first-run", "about:blank"])
+        [chrome, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+         "--no-first-run", "--start-maximized", "https://weread.qq.com/"])
     atexit.register(lambda: kill_tree(proc))
     endpoint = f"http://localhost:{port}"
     for _ in range(40):
@@ -116,9 +125,9 @@ def main() -> None:
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(endpoint)
-        context = browser.new_context(viewport={"width": 1920, "height": 1080})
+        ck = ensure_cookie(browser)                       # 登录用 Chrome 自己的窗口（屏幕自然大小）
+        context = browser.new_context(viewport={"width": 1920, "height": 1080})  # 抓取用固定 viewport
         context.add_init_script(hook_js)
-        ck = ensure_cookie(context)
         context.add_cookies([{"name": k, "value": v, "url": "https://weread.qq.com", "secure": True} for k, v in ck.items()])
         page = context.new_page()
         book_info, chapters = get_meta(page, encode_id)
@@ -146,6 +155,7 @@ def main() -> None:
                 page.wait_for_timeout(1000)
             initial_url = page.url
             prev_md = ""
+            no_growth = 0
             for _ in range(80):
                 try:
                     cur_md = page.evaluate("window.canvasContextHandler.data.markdown") or ""
@@ -153,6 +163,21 @@ def main() -> None:
                     cur_md = prev_md
                 if page.url != initial_url:
                     break
+                # 检测全书/本章读完标记（页面文字），比 md 不增长更明确可靠
+                try:
+                    body_text = page.evaluate("document.body.innerText") or ""
+                except Exception:
+                    body_text = ""
+                if any(mark in body_text for mark in ("全书完", "本书已读完", "已读完", "全文完")):
+                    prev_md = cur_md
+                    break
+                # 兜底：连续多次翻页内容不再增长，也认为本章读完
+                if cur_md == prev_md:
+                    no_growth += 1
+                    if no_growth >= 3:
+                        break
+                else:
+                    no_growth = 0
                 prev_md = cur_md
                 page.keyboard.press("ArrowRight")
                 page.wait_for_timeout(3500)
