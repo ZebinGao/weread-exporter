@@ -109,10 +109,34 @@ python full_book.py <ENCODE_ID>
 
 首次运行会弹出 Chrome 窗口，扫码登录微信读书。cookie 自动存 `cache/cookie.txt`，之后无需重复扫码。cookie 失效时（章节"加载失败"）删掉 `cache/cookie.txt` 重跑即可。
 
-### 4. 取结果
+### 4. 修复段落换行（fix_paragraphs.py）
 
-- 完整电子书：`output/<书名>.epub`
-- 每章 markdown 源文件：`output/chapters/*.md`（支持断点续传，中断后重跑会自动跳过已抓章节）
+`full_book.py` 抓到的 md 里，每个 canvas 视觉行都被当成独立段落（一行一段）。用 `fix_paragraphs.py` 后处理：合并被屏幕换行截断的段落、保留独句成段。
+
+```bash
+python fix_paragraphs.py                     # 处理 output/chapters/*.md（自动备份 .bak）
+python fix_paragraphs.py 004.md --min 20     # 处理指定文件 / 调独句长度阈值（默认 15）
+```
+
+规则：
+
+- 行末是句末标点（。！？；：）」"'… 等）→ 段落结束
+- 行末非句末标点 + 行够长 → 段内被屏幕换行截断，合并到当前段
+- 行末非句末标点 + 行短（< `--min`）→ 独句成段，保留独立
+
+### 5. 重新生成 epub（make_epub.py）
+
+段落修复后，用修复的 md 重新打包 epub（覆盖 `full_book.py` 自动生成的那版原始换行 epub）：
+
+```bash
+python make_epub.py            # 书名自动从 newbook.log 读取
+python make_epub.py "<书名>"   # 或手动指定
+```
+
+### 6. 取结果
+
+- 完整电子书（段落已修复）：`output/<书名>.epub`
+- 每章 markdown：`output/chapters/*.md`（修复版）/ `*.bak`（原始抓取版）
 
 ### 注意事项
 

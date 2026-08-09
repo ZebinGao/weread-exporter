@@ -156,7 +156,10 @@ def main() -> None:
             initial_url = page.url
             prev_md = ""
             no_growth = 0
-            for _ in range(80):
+            # 大章按字数估算页数（每页约 1500 字，留余量），小章至少 80 页
+            max_pages = max(80, (ch.get("wordCount") or 0) // 1500 + 10)
+            page_idx = 0
+            for page_idx in range(max_pages):
                 try:
                     cur_md = page.evaluate("window.canvasContextHandler.data.markdown") or ""
                 except Exception:
@@ -174,17 +177,19 @@ def main() -> None:
                 # 兜底：连续多次翻页内容不再增长，也认为本章读完
                 if cur_md == prev_md:
                     no_growth += 1
-                    if no_growth >= 3:
+                    if no_growth >= 8:
                         break
                 else:
                     no_growth = 0
                 prev_md = cur_md
+                if page_idx % 20 == 0:
+                    print(f"    ... {title} p{page_idx+1} md_len={len(cur_md)}", flush=True)
                 page.keyboard.press("ArrowRight")
                 page.wait_for_timeout(3500)
             md_clean = prev_md.replace("\u200b", "")
             with open(md_file, "w", encoding="utf-8") as f:
                 f.write(md_clean)
-            print(f"[{idx+1}/{len(chapters)}] {title}: {len(md_clean)} chars", flush=True)
+            print(f"[{idx+1}/{len(chapters)}] {title}: {len(md_clean)} chars (pages~{page_idx+1})", flush=True)
         browser.close()
 
     # 生成 epub
